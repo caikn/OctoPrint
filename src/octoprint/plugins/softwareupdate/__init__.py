@@ -8,6 +8,7 @@ __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms
 
 import octoprint.plugin
 
+import copy
 import flask
 import os
 import threading
@@ -15,18 +16,25 @@ import time
 import logging
 import logging.handlers
 import hashlib
-import traceback
 
+# noinspection PyCompatibility
 from concurrent import futures
 
 from . import version_checks, updaters, exceptions, util, cli
 
-from flask.ext.babel import gettext
+from flask_babel import gettext
 
 from octoprint.server.util.flask import restricted_access, with_revalidation_checking, check_etag
 from octoprint.server import admin_permission, VERSION, REVISION, BRANCH
 from octoprint.util import dict_merge, to_unicode
+from octoprint.util.version import get_comparable_version
+from octoprint.util.pip import LocalPipCaller
 import octoprint.settings
+
+
+MINIMUM_PYTHON = "2.7.9"
+MINIMUM_SETUPTOOLS = "5.5.1"
+MINIMUM_PIP = "9.0.1"
 
 
 ##~~ Plugin
@@ -42,6 +50,9 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 	COMMIT_TRACKING_TYPES = ("github_commit", "bitbucket_commit")
 
+	DATA_FORMAT_VERSION = "v4"
+
+	# noinspection PyMissingConstructor
 	def __init__(self):
 		self._update_in_progress = False
 		self._configured_checks_mutex = threading.Lock()
@@ -57,6 +68,10 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		self._version_cache_path = None
 		self._version_cache_dirty = False
 		self._version_cache_timestamp = None
+
+		self._environment_supported = True
+		self._environment_versions = dict()
+		self._environment_ready = threading.Event()
 
 		self._console_logger = None
 
@@ -84,14 +99,8 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		self._console_logger.propagate = False
 
 	def on_after_startup(self):
-		# refresh cache now if necessary so it's faster once the user connects to the instance - but decouple it from
-		# the server startup
-		def fetch_data():
-			self.get_current_versions()
-
-		thread = threading.Thread(target=fetch_data)
-		thread.daemon = True
-		thread.start()
+		self._check_environment()
+		self.get_current_versions()
 
 	def _get_configured_checks(self):
 		with self._configured_checks_mutex:
@@ -101,6 +110,9 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 				update_check_hooks = self._plugin_manager.get_hooks("octoprint.plugin.softwareupdate.check_config")
 				check_providers = self._settings.get(["check_providers"], merged=True)
+				if not isinstance(check_providers, dict):
+					check_providers = dict()
+
 				effective_configs = dict()
 
 				for name, hook in update_check_hooks.items():
@@ -161,6 +173,24 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 			return self._configured_checks
 
+	def _check_environment(self):
+		from platform import python_version
+		import pkg_resources
+
+		local_pip = LocalPipCaller()
+
+		# check python and setuptools version
+		versions = dict(python=python_version(),
+		                setuptools=pkg_resources.get_distribution("setuptools").version,
+		                pip=local_pip.version_string)
+		supported = get_comparable_version(versions["python"]) >= get_comparable_version(MINIMUM_PYTHON) \
+		       and get_comparable_version(versions["setuptools"]) >= get_comparable_version(MINIMUM_SETUPTOOLS) \
+		       and get_comparable_version(versions["pip"]) >= get_comparable_version(MINIMUM_PIP)
+
+		self._environment_supported = supported
+		self._environment_versions = versions
+		self._environment_ready.set()
+
 	def _load_version_cache(self):
 		if not os.path.isfile(self._version_cache_path):
 			return
@@ -216,13 +246,18 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 	def get_settings_defaults(self):
 		update_script = os.path.join(self._basefolder, "scripts", "update-octoprint.py")
+		default_update_script = "{{python}} \"{update_script}\" --branch={{branch}} " \
+		                        "--force={{force}} \"{{folder}}\" {{target}}".format(update_script=update_script)
+
 		return {
 			"checks": {
 				"octoprint": {
 					"type": "github_release",
 					"user": "foosel",
 					"repo": "OctoPrint",
-					"update_script": "{{python}} \"{update_script}\" --branch={{branch}} --force={{force}} \"{{folder}}\" {{target}}".format(update_script=update_script),
+					"method": "pip",
+					"pip": "https://github.com/foosel/OctoPrint/archive/{target_version}.zip",
+					"update_script": default_update_script,
 					"restart": "octoprint",
 					"stable_branch": dict(branch="master", commitish=["master"], name="Stable"),
 					"prerelease_branches": [dict(branch="rc/maintenance",
@@ -298,28 +333,10 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		if "notify_users" in data:
 			self._settings.set_boolean(["notify_users"], data["notify_users"])
 
-		checks = self._get_configured_checks()
-		if "octoprint" in checks:
-			check = checks["octoprint"]
-			update_type = check.get("type", None)
-			checkout_folder = check.get("checkout_folder", None)
-			update_folder = check.get("update_folder", None)
-			prerelease = check.get("prerelease", False)
-			prerelease_channel = check.get("prerelease_channel", None)
-		else:
-			update_type = checkout_folder = update_folder = prerelease_channel = None
-			prerelease = False
-
 		defaults = dict(
 			plugins=dict(softwareupdate=dict(
 				checks=dict(
-					octoprint=dict(
-						type=update_type,
-						checkout_folder=checkout_folder,
-						update_folder=update_folder,
-						prerelease=prerelease,
-						prerelease_channel=prerelease_channel
-					)
+					octoprint=self.get_settings_defaults()["checks"]["octoprint"]
 				)
 			))
 		)
@@ -328,12 +345,32 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 		if "octoprint_checkout_folder" in data:
 			self._settings.set(["checks", "octoprint", "checkout_folder"], data["octoprint_checkout_folder"], defaults=defaults, force=True)
-			if update_folder and data["octoprint_checkout_folder"]:
+			if self._settings.get(["checks", "octoprint", "update_folder"]) and data["octoprint_checkout_folder"]:
 				self._settings.set(["checks", "octoprint", "update_folder"], None, defaults=defaults, force=True)
 			updated_octoprint_check_config = True
 
-		if "octoprint_type" in data and data["octoprint_type"] in ("github_release", "git_commit"):
-			self._settings.set(["checks", "octoprint", "type"], data["octoprint_type"], defaults=defaults, force=True)
+		if "octoprint_type" in data:
+			octoprint_type = data["octoprint_type"]
+
+			if octoprint_type == "github_release":
+				self._settings.set(["checks", "octoprint", "type"], octoprint_type, defaults=defaults)
+				self._settings.set(["checks", "octoprint", "method"], "pip", defaults=defaults)
+				updated_octoprint_check_config = True
+
+			elif octoprint_type == "git_commit":
+				self._settings.set(["checks", "octoprint", "type"], octoprint_type, defaults=defaults)
+				self._settings.set(["checks", "octoprint", "method"], "update_script", defaults=defaults)
+				updated_octoprint_check_config = True
+
+		if "octoprint_release_channel" in data:
+			prerelease_branches = self._settings.get(["checks", "octoprint", "prerelease_branches"])
+			if prerelease_branches and data["octoprint_release_channel"] in [x["branch"] for x in prerelease_branches]:
+				self._settings.set(["checks", "octoprint", "prerelease"], True, defaults=defaults, force=True)
+				self._settings.set(["checks", "octoprint", "prerelease_channel"], data["octoprint_release_channel"],
+				                   defaults=defaults, force=True)
+			else:
+				self._settings.set(["checks", "octoprint", "prerelease"], False, defaults=defaults, force=True)
+				self._settings.set(["checks", "octoprint", "prerelease_channel"], None, defaults=defaults, force=True)
 			updated_octoprint_check_config = True
 
 		if updated_octoprint_check_config:
@@ -344,21 +381,22 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 				pass
 			self._version_cache_dirty = True
 
-		if "octoprint_release_channel" in data:
-			prerelease_branches = self._settings.get(["checks", "octoprint", "prerelease_branches"])
-			if prerelease_branches and data["octoprint_release_channel"] in [x["branch"] for x in prerelease_branches]:
-				self._settings.set(["checks", "octoprint", "prerelease"], True, defaults=defaults, force=True)
-				self._settings.set(["checks", "octoprint", "prerelease_channel"], data["octoprint_release_channel"], defaults=defaults, force=True)
-				self._refresh_configured_checks = True
-			else:
-				self._settings.set(["checks", "octoprint", "prerelease"], False, defaults=defaults, force=True)
-				self._settings.set(["checks", "octoprint", "prerelease_channel"], None, defaults=defaults, force=True)
-				self._refresh_configured_checks = True
-
 	def get_settings_version(self):
-		return 5
+		return 6
 
 	def on_settings_migrate(self, target, current=None):
+
+		if current is None or current < 6:
+			# up until & including config version 5 we didn't set the method parameter for the octoprint check
+			# configuration
+
+			configured_checks = self._settings.get(["checks"], incl_defaults=False)
+			if configured_checks is not None and "octoprint" in configured_checks:
+				octoprint_check = dict(configured_checks["octoprint"])
+
+				if not "method" in octoprint_check and octoprint_check.get("type") == "git_commit":
+					defaults = dict(plugins=dict(softwareupdate=dict(checks=dict(octoprint=dict(method="pip")))))
+					self._settings.set(["checks", "octoprint", "method"], "update_script", defaults=defaults)
 
 		if current == 4:
 			# config version 4 didn't correctly remove the old settings for octoprint_restart_command
@@ -471,11 +509,17 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		force = flask.request.values.get("force", "false") in octoprint.settings.valid_boolean_trues
 
 		def view():
+			self._environment_ready.wait(timeout=30.0)
+
 			try:
 				information, update_available, update_possible = self.get_current_versions(check_targets=check_targets, force=force)
-				return flask.jsonify(dict(status="updatePossible" if update_available and update_possible else "updateAvailable" if update_available else "current",
+				return flask.jsonify(dict(status="inProgress" if self._update_in_progress else "updatePossible" if update_available and update_possible and self._environment_supported else "updateAvailable" if update_available else "current",
 				                          information=information,
-				                          timestamp=self._version_cache_timestamp))
+				                          timestamp=self._version_cache_timestamp,
+				                          environment=dict(supported=self._environment_supported,
+				                                           versions=[dict(name=gettext("Python"), current=self._environment_versions.get("python", "unknown"), minimum=MINIMUM_PYTHON),
+				                                                     dict(name=gettext("pip"), current=self._environment_versions.get("pip", "unknown"), minimum=MINIMUM_PIP),
+				                                                     dict(name=gettext("setuptools"), current=self._environment_versions.get("setuptools", "unknown"), minimum=MINIMUM_SETUPTOOLS)])))
 			except exceptions.ConfigurationInvalid as e:
 				return flask.make_response("Update not properly configured, can't proceed: %s" % e.message, 500)
 
@@ -502,8 +546,12 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 					hash.update(str(data.get("online", None)))
 
 			hash.update(",".join(targets))
+
+			hash.update(str(self._environment_supported))
 			hash.update(str(self._version_cache_timestamp))
 			hash.update(str(self._connectivity_checker.online))
+			hash.update(str(self._update_in_progress))
+			hash.update(self.DATA_FORMAT_VERSION)
 			return hash.hexdigest()
 
 		def condition():
@@ -522,22 +570,25 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 			# do not update while a print job is running
 			return flask.make_response("Printer is currently printing or paused", 409)
 
+		if not self._environment_supported:
+			return flask.make_response("Direct updates are not supported in this Python environment", 409)
+
 		if not "application/json" in flask.request.headers["Content-Type"]:
 			return flask.make_response("Expected content-type JSON", 400)
 
 		json_data = flask.request.json
 
-		if "check" in json_data:
-			check_targets = map(lambda x: x.strip(), json_data["check"])
+		if "targets" in json_data:
+			targets = map(lambda x: x.strip(), json_data["targets"])
 		else:
-			check_targets = None
+			targets = None
 
 		if "force" in json_data and json_data["force"] in octoprint.settings.valid_boolean_trues:
 			force = True
 		else:
 			force = False
 
-		to_be_checked, checks = self.perform_updates(check_targets=check_targets, force=force)
+		to_be_checked, checks = self.perform_updates(targets=targets, force=force)
 		return flask.jsonify(dict(order=to_be_checked, checks=checks))
 
 	#~~ Asset API
@@ -546,13 +597,14 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		return dict(
 			css=["css/softwareupdate.css"],
 			js=["js/softwareupdate.js"],
+			clientjs=["clientjs/softwareupdate.js"],
 			less=["less/softwareupdate.less"]
 		)
 
 	##~~ TemplatePlugin API
 
 	def get_template_configs(self):
-		from flask.ext.babel import gettext
+		from flask_babel import gettext
 		return [
 			dict(type="settings", name=gettext("Software Update"))
 		]
@@ -563,7 +615,7 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		checks = self._get_configured_checks()
 		check = checks.get("octoprint", None)
 		checkout_folder = self._get_octoprint_checkout_folder(checks=checks)
-		return check and "update_script" in check and not checkout_folder
+		return check and "method" in check and check["method"] == "update_script" and not checkout_folder
 
 	##~~ EventHandlerPlugin API
 
@@ -632,6 +684,7 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 							continue
 
 						target_information, target_update_available, target_update_possible, target_online, target_error = future.result()
+						target_update_possible = target_update_possible and self._environment_supported
 
 						target_information = dict_merge(dict(local=dict(name="?", value="?"),
 						                                     remote=dict(name="?", value="?",
@@ -667,6 +720,9 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 						                           releaseNotes=release_notes,
 						                           online=target_online,
 						                           error=target_error)
+
+						if target == "octoprint" and "released_version" in populated_check:
+							information[target]["released_version"] = populated_check["released_version"]
 
 				if self._version_cache_dirty:
 					self._save_version_cache()
@@ -755,12 +811,18 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		self._version_cache_dirty = True
 		return information, update_available, update_possible, online, error
 
-	def perform_updates(self, check_targets=None, force=False):
+	def perform_updates(self, force=False, **kwargs):
 		"""
 		Performs the updates for the given check_targets. Will update all possible targets by default.
 
-		:param check_targets: an iterable defining the targets to update, if not supplied defaults to all targets
+		:param targets: an iterable defining the targets to update, if not supplied defaults to all targets
 		"""
+
+		if not self._environment_supported:
+			self._logger.error("Direct updates are unsupported in this environment")
+			return [], dict()
+
+		targets = kwargs.get("targets", kwargs.get("check_targets", None))
 
 		checks = self._get_configured_checks()
 		populated_checks = dict()
@@ -772,9 +834,9 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 			except:
 				self._logger.exception("Error while populating check prior to update for target {}".format(target))
 
-		if check_targets is None:
-			check_targets = populated_checks.keys()
-		to_be_updated = sorted(set(check_targets) & set(populated_checks.keys()))
+		if targets is None:
+			targets = populated_checks.keys()
+		to_be_updated = sorted(set(targets) & set(populated_checks.keys()))
 		if "octoprint" in to_be_updated:
 			to_be_updated.remove("octoprint")
 			tmp = ["octoprint"] + to_be_updated
@@ -879,6 +941,20 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		# determine the target version to update to
 		target_version = information["remote"]["value"]
 		target_error = False
+		target_result = None
+
+		def trigger_event(success, **additional_payload):
+			if success:
+				event = "update_succeeded"
+			else:
+				event = "update_failed"
+
+			payload = copy.copy(additional_payload)
+			payload.update(dict(target=target,
+			                    from_version=information["local"]["value"],
+			                    to_version=target_version))
+
+			self._event_bus.fire("plugin_softwareupdate_{}".format(event), payload=payload)
 
 		### The actual update procedure starts here...
 
@@ -893,6 +969,7 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 			update_result = updater.perform_update(target, populated_check, target_version, log_cb=self._log, online=online)
 			target_result = ("success", update_result)
 			self._logger.info("Update of %s to %s successful!" % (target, target_version))
+			trigger_event(True)
 
 		except exceptions.UnknownUpdateType:
 			self._logger.warn("Update of %s can not be performed, unknown update type" % target)
@@ -904,7 +981,9 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 			self._send_client_message("update_failed", dict(target=target, version=target_version, name=populated_check["displayName"], reason="No internet connection"))
 
 		except Exception as e:
-			self._logger.exception("Update of %s can not be performed" % target)
+			self._logger.exception("Update of %s can not be performed, please also check plugin_softwareupdate_console.log for possible causes of this" % target)
+			trigger_event(False)
+
 			if not "ignorable" in populated_check or not populated_check["ignorable"]:
 				target_error = True
 
@@ -942,7 +1021,7 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 		self._logger.info("Restarting...")
 		try:
-			util.execute(restart_command, evaluate_returncode=False, async=True)
+			util.execute(restart_command, evaluate_returncode=False, do_async=True)
 		except exceptions.ScriptError as e:
 			self._logger.exception("Error while restarting via command {}".format(restart_command))
 			self._logger.warn("Restart stdout:\n{}".format(e.stdout))
@@ -956,7 +1035,9 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		result = dict(check)
 
 		if target == "octoprint":
-			from flask.ext.babel import gettext
+			from flask_babel import gettext
+
+			from octoprint.util.version import is_released_octoprint_version, is_stable_octoprint_version
 
 			result["displayName"] = to_unicode(check.get("displayName"), errors="replace")
 			if result["displayName"] is None:
@@ -975,48 +1056,42 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 				stable_branch = check["stable_branch"]["branch"]
 			if "prerelease_branches" in check:
 				release_branches += [x["branch"] for x in check["prerelease_branches"]]
-			result["released_version"] = not release_branches or BRANCH in release_branches
+			result["released_version"] = is_released_octoprint_version()
 
 			if check["type"] in self.COMMIT_TRACKING_TYPES:
 				result["current"] = REVISION if REVISION else "unknown"
 			else:
 				result["current"] = VERSION
 
-				if check["type"] == "github_release" and (check.get("prerelease", None) or BRANCH != stable_branch):
-					# we are tracking github releases and are either also tracking prerelease OR are currently installed
-					# from something that is not the stable (master) branch => we need to change some parameters
+				if check["type"] == "github_release" and (check.get("prerelease", None) or not is_stable_octoprint_version()):
+					# we are tracking github releases and are either also tracking prerelease OR are currently running
+					# a non stable version => we need to change some parameters
 
 					# we compare versions fully, not just the base so that we see a difference
 					# between RCs + stable for the same version release
 					result["force_base"] = False
 
+					if check.get("prerelease", None):
+						# we are tracking prereleases => we want to be on the correct prerelease channel/branch
+						channel = check.get("prerelease_channel", None)
+						if channel:
+							# if we have a release channel, we also set our update_branch here to our release channel
+							# in case it's not already set
+							result["update_branch"] = check.get("update_branch", channel)
+
+					else:
+						# we are not tracking prereleases, but aren't on the stable branch either => switch back
+						# to stable branch on update
+						result["update_branch"] = check.get("update_branch", stable_branch)
+
 					if check.get("update_script", None):
-						# if we are using the update_script, we need to set our update_branch
-
-						if check.get("prerelease", None):
-							# we are tracking prereleases => we want to be on the correct prerelease channel/branch
-							channel = check.get("prerelease_channel", None)
-							if channel:
-								# if we have a release channel, we also set our update_branch here to our release channel
-								# in case it's not already set
-								result["update_branch"] = check.get("update_branch", channel)
-
-						else:
-							# we are not tracking prereleases, but aren't on the stable branch either => switch back
-							# to stable branch on update
-							result["update_branch"] = check.get("update_branch", stable_branch)
-
-						# we also force an exact version
+						# we force an exact version & python unequality check, to be able to downgrade
 						result["force_exact_version"] = True
+						result["release_compare"] = "python_unequal"
 
-						if BRANCH != result.get("prerelease_channel"):
-							# we force python unequality check here because that will also allow us to
-							# downgrade on a prerelease channel change (rc/devel => rc/maintenance)
-							#
-							# we detect channel changes by comparing the current branch with the target
-							# branch of the release channel - unequality means we might have to handle
-							# a downgrade
-							result["release_compare"] = "python_unequal"
+					elif check.get("pip", None):
+						# we force python unequality check for pip installs, to be able to downgrade
+						result["release_compare"] = "python_unequal"
 
 		else:
 			result["displayName"] = to_unicode(check.get("displayName"), errors="replace")
@@ -1102,7 +1177,8 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 
 		mapping = dict(update_script=updaters.update_script,
 		               pip=updaters.pip,
-		               python_updater=updaters.python_updater)
+		               python_updater=updaters.python_updater,
+		               sleep_a_bit=updaters.sleep_a_bit)
 
 		method = self._get_update_method(target, check, valid_methods=mapping.keys())
 		return mapping[method]

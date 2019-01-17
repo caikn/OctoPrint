@@ -21,6 +21,7 @@ __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms
 
 import os
 import logging
+import threading
 
 from octoprint.settings import settings as s
 from octoprint.plugin.core import (PluginInfo, PluginManager, Plugin)
@@ -44,8 +45,9 @@ def _validate_plugin(phase, plugin_info):
 			setattr(plugin_info.instance, PluginInfo.attr_hooks, hooks)
 	return True
 
-def plugin_manager(init=False, plugin_folders=None, plugin_types=None, plugin_entry_points=None, plugin_disabled_list=None,
-                   plugin_restart_needing_hooks=None, plugin_obsolete_hooks=None, plugin_validators=None):
+def plugin_manager(init=False, plugin_folders=None, plugin_bases=None, plugin_entry_points=None, plugin_disabled_list=None,
+                   plugin_blacklist=None, plugin_restart_needing_hooks=None, plugin_obsolete_hooks=None,
+                   plugin_validators=None):
 	"""
 	Factory method for initially constructing and consecutively retrieving the :class:`~octoprint.plugin.core.PluginManager`
 	singleton.
@@ -58,13 +60,13 @@ def plugin_manager(init=False, plugin_folders=None, plugin_types=None, plugin_en
 	    plugin_folders (list): A list of folders (as strings containing the absolute path to them) in which to look for
 	        potential plugin modules. If not provided this defaults to the configured ``plugins`` base folder and
 	        ``src/plugins`` within OctoPrint's code base.
-	    plugin_types (list): A list of recognized plugin types for which to look for provided implementations. If not
-	        provided this defaults to the plugin types found in :mod:`octoprint.plugin.types` without
-	        :class:`~octoprint.plugin.OctoPrintPlugin`.
+	    plugin_bases (list): A list of recognized plugin base classes for which to look for provided implementations. If not
+	        provided this defaults to :class:`~octoprint.plugin.OctoPrintPlugin`.
 	    plugin_entry_points (list): A list of entry points pointing to modules which to load as plugins. If not provided
 	        this defaults to the entry point ``octoprint.plugin``.
 	    plugin_disabled_list (list): A list of plugin identifiers that are currently disabled. If not provided this
 	        defaults to all plugins for which ``enabled`` is set to ``False`` in the settings.
+	    plugin_blacklist (list): A list of plugin identifiers/identifier-version tuples that are currently blacklisted.
 	    plugin_restart_needing_hooks (list): A list of hook namespaces which cause a plugin to need a restart in order
 	        be enabled/disabled. Does not have to contain full hook identifiers, will be matched with startswith similar
 	        to logging handlers
@@ -88,24 +90,13 @@ def plugin_manager(init=False, plugin_folders=None, plugin_types=None, plugin_en
 
 	else:
 		if init:
-			if plugin_types is None:
-				plugin_types = [StartupPlugin,
-				                ShutdownPlugin,
-				                TemplatePlugin,
-				                SettingsPlugin,
-				                SimpleApiPlugin,
-				                AssetPlugin,
-				                BlueprintPlugin,
-				                EventHandlerPlugin,
-				                SlicerPlugin,
-				                AppPlugin,
-				                ProgressPlugin,
-				                WizardPlugin,
-				                UiPlugin]
+			if plugin_bases is None:
+				plugin_bases = [OctoPrintPlugin]
 
 			if plugin_restart_needing_hooks is None:
 				plugin_restart_needing_hooks = ["octoprint.server.http.*",
-				                                "octoprint.printer.factory"]
+				                                "octoprint.printer.factory",
+				                                "octoprint.timelapse.extensions"]
 
 			if plugin_obsolete_hooks is None:
 				plugin_obsolete_hooks = ["octoprint.comm.protocol.gcode"]
@@ -116,10 +107,11 @@ def plugin_manager(init=False, plugin_folders=None, plugin_types=None, plugin_en
 				plugin_validators.append(_validate_plugin)
 
 			_instance = PluginManager(plugin_folders,
-			                          plugin_types,
+			                          plugin_bases,
 			                          plugin_entry_points,
 			                          logging_prefix="octoprint.plugins.",
 			                          plugin_disabled_list=plugin_disabled_list,
+			                          plugin_blacklist=plugin_blacklist,
 			                          plugin_restart_needing_hooks=plugin_restart_needing_hooks,
 			                          plugin_obsolete_hooks=plugin_obsolete_hooks,
 			                          plugin_validators=plugin_validators)
@@ -177,7 +169,8 @@ def plugin_settings_for_settings_plugin(plugin_key, instance, settings=None):
 	return plugin_settings(plugin_key, get_preprocessors=get_preprocessors, set_preprocessors=set_preprocessors, settings=settings)
 
 
-def call_plugin(types, method, args=None, kwargs=None, callback=None, error_callback=None, sorting_context=None, initialized=True):
+def call_plugin(types, method, args=None, kwargs=None, callback=None, error_callback=None, sorting_context=None,
+                initialized=True):
 	"""
 	Helper method to invoke the indicated ``method`` on all registered plugin implementations implementing the
 	indicated ``types``. Allows providing method arguments and registering callbacks to call in case of success
@@ -215,7 +208,6 @@ def call_plugin(types, method, args=None, kwargs=None, callback=None, error_call
 	        identifier, ``plugin`` the plugin implementation instance itself and ``exc`` the caught exception.
 	    initialized (boolean): Whether the plugin needs to be initialized (True) or not (False). Initialization status
 	        is determined be presence of injected ``_identifier`` property.
-
 	"""
 
 	if not isinstance(types, (list, tuple)):
@@ -225,18 +217,21 @@ def call_plugin(types, method, args=None, kwargs=None, callback=None, error_call
 	if kwargs is None:
 		kwargs = dict()
 
+	logger = logging.getLogger(__name__)
+
 	plugins = plugin_manager().get_implementations(*types, sorting_context=sorting_context)
 	for plugin in plugins:
 		if initialized and not hasattr(plugin, "_identifier"):
 			continue
 
 		if hasattr(plugin, method):
+			logger.debug("Calling {} on {}".format(method, plugin._identifier))
 			try:
 				result = getattr(plugin, method)(*args, **kwargs)
 				if callback:
 					callback(plugin._identifier, plugin, result)
 			except Exception as exc:
-				logging.getLogger(__name__).exception("Error while calling plugin %s" % plugin._identifier)
+				logger.exception("Error while calling plugin %s" % plugin._identifier)
 				if error_callback:
 					error_callback(plugin._identifier, plugin, exc)
 

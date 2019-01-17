@@ -167,7 +167,11 @@ class FileManagerTest(unittest.TestCase):
 		file_path = self.file_manager.add_file(octoprint.filemanager.FileDestinations.LOCAL, "test.gcode", wrapper)
 
 		self.assertEqual(("", "test.gcode"), file_path)
-		self.local_storage.add_file.assert_called_once_with("test.gcode", wrapper, printer_profile=test_profile, allow_overwrite=False, links=None)
+		self.local_storage.add_file.assert_called_once_with("test.gcode", wrapper,
+		                                                    printer_profile=test_profile,
+		                                                    allow_overwrite=False,
+		                                                    links=None,
+		                                                    display=None)
 
 		expected_events = [mock.call(octoprint.filemanager.Events.FILE_ADDED, dict(storage=octoprint.filemanager.FileDestinations.LOCAL,
 		                                                                           name="test.gcode",
@@ -175,6 +179,26 @@ class FileManagerTest(unittest.TestCase):
 		                                                                           type=["machinecode", "gcode"])),
 		                   mock.call(octoprint.filemanager.Events.UPDATED_FILES, dict(type="printables"))]
 		self.fire_event.call_args_list = expected_events
+
+	def test_add_file_display(self):
+		wrapper = object()
+
+		self.local_storage.add_file.return_value = ("", "test.gcode")
+		self.local_storage.path_on_disk.return_value = "prefix/test.gcode"
+		self.local_storage.split_path.return_value = ("", "test.gcode")
+
+		test_profile = dict(id="_default", name="My Default Profile")
+		self.printer_profile_manager.get_current_or_default.return_value = test_profile
+
+		file_path = self.file_manager.add_file(octoprint.filemanager.FileDestinations.LOCAL, "test.gcode", wrapper,
+		                                       display=u"täst.gcode")
+
+		self.assertEqual(("", "test.gcode"), file_path)
+		self.local_storage.add_file.assert_called_once_with("test.gcode", wrapper,
+		                                                    printer_profile=test_profile,
+		                                                    allow_overwrite=False,
+		                                                    links=None,
+		                                                    display=u"täst.gcode")
 
 	def test_remove_file(self):
 		self.local_storage.path_on_disk.return_value = "prefix/test.gcode"
@@ -198,7 +222,10 @@ class FileManagerTest(unittest.TestCase):
 		folder_path = self.file_manager.add_folder(octoprint.filemanager.FileDestinations.LOCAL, "test_folder")
 
 		self.assertEqual(("", "test_folder"), folder_path)
-		self.local_storage.add_folder.assert_called_once_with("test_folder", ignore_existing=True)
+		self.local_storage.add_folder.assert_called_once_with("test_folder",
+		                                                      ignore_existing=True,
+		                                                      display=None)
+
 		expected_events = [mock.call(octoprint.filemanager.Events.FOLDER_ADDED, dict(storage=octoprint.filemanager.FileDestinations.LOCAL,
 		                                                                             name="test_folder",
 		                                                                             path="test_folder")),
@@ -213,7 +240,20 @@ class FileManagerTest(unittest.TestCase):
 			self.fail("Expected an exception to occur!")
 		except RuntimeError as e:
 			self.assertEqual("already there", e.message)
-		self.local_storage.add_folder.assert_called_once_with("test_folder", ignore_existing=False)
+		self.local_storage.add_folder.assert_called_once_with("test_folder", ignore_existing=False, display=None)
+
+	def test_add_folder_display(self):
+		self.local_storage.add_folder.side_effect = RuntimeError("already there")
+
+		try:
+			self.file_manager.add_folder(octoprint.filemanager.FileDestinations.LOCAL, "test_folder",
+			                             display=u"täst_folder")
+			self.fail("Expected an exception to occur!")
+		except RuntimeError as e:
+			self.assertEqual("already there", e.message)
+		self.local_storage.add_folder.assert_called_once_with("test_folder",
+		                                                      ignore_existing=True,
+		                                                      display=u"täst_folder")
 
 	def test_remove_folder(self):
 		self.local_storage.split_path.return_value = ("", "test_folder")
@@ -260,28 +300,8 @@ class FileManagerTest(unittest.TestCase):
 		                date=now)
 
 
-		mock_atomic_write.assert_called_with(recovery_file)
+		mock_atomic_write.assert_called_with(recovery_file, max_permissions=438)
 		mock_yaml_safe_dump.assert_called_with(expected, stream=mock_atomic_write_handle, default_flow_style=False, indent="  ", allow_unicode=True)
-
-	@mock.patch("octoprint.util.atomic_write", create=True)
-	@mock.patch("yaml.safe_dump", create=True)
-	@mock.patch("time.time")
-	def test_save_recovery_data(self, mock_time, mock_yaml_safe_dump, mock_atomic_write):
-		import os
-
-		now = 123456789
-		path = "some_file.gco"
-		pos = 1234
-		recovery_file = os.path.join("/path/to/a/base_folder", "print_recovery_data.yaml")
-
-		mock_atomic_write.return_value = mock.MagicMock(spec=file)
-		mock_atomic_write_handle = mock_atomic_write.return_value.__enter__.return_value
-		mock_time.return_value = now
-		self.local_storage.path_in_storage.return_value = path
-
-		mock_yaml_safe_dump.side_effect = RuntimeError
-
-		self.file_manager.save_recovery_data(octoprint.filemanager.FileDestinations.LOCAL, path, pos)
 
 	@mock.patch("os.path.isfile")
 	@mock.patch("os.remove")
@@ -312,29 +332,26 @@ class FileManagerTest(unittest.TestCase):
 
 		self.file_manager.delete_recovery_data()
 
-	@mock.patch("os.path.isfile")
-	@mock.patch("yaml.safe_load")
-	def test_get_recovery_data(self, mock_yaml_safe_load, mock_isfile):
-		import os
-		recovery_file = os.path.join("/path/to/a/base_folder", "print_recovery_data.yaml")
+	@mock.patch("os.path.isfile", return_value=True)
+	def test_get_recovery_data(self, mock_isfile):
+	  import os
+	  import yaml
+	  recovery_file = os.path.join("/path/to/a/base_folder", "print_recovery_data.yaml")
 
-		mock_isfile.return_value = True
+	  data = dict(path="some_path.gco",
+	              origin="local",
+	              pos=1234,
+	              date=123456789)
+	  text_data = yaml.dump(data)
 
-		data = dict(path="some_path.gco",
-		            origin="local",
-		            pos=1234,
-		            date=123456789)
-		mock_yaml_safe_load.return_value = data
+	  with mock.patch("__builtin__.open", mock.mock_open(read_data=text_data)) as m:
+	    # moved safe_load to here so we could mock up the return value properly
+	    with mock.patch("yaml.safe_load", return_value=data) as n:
+	      result = self.file_manager.get_recovery_data()
 
-		with mock.patch("__builtin__.open", mock.mock_open(read_data=data), create=True) as m:
-			result = self.file_manager.get_recovery_data()
-
-			self.assertDictEqual(data, result)
-
-			m.assert_called_with(recovery_file)
-
-			mock_handle = m()
-			mock_yaml_safe_load.assert_called_with(mock_handle)
+	      self.assertDictEqual(data, result)
+	      n.assert_called_with(m())
+	      mock_isfile.assert_called_with(recovery_file)
 
 	@mock.patch("os.path.isfile")
 	def test_get_recovery_data_no_file(self, mock_isfile):
@@ -409,7 +426,7 @@ class FileManagerTest(unittest.TestCase):
 		self.local_storage.split_path.side_effect = split_path
 
 		# mock add_file method on local storage
-		def add_file(path, file_obj, printer_profile=None, links=None, allow_overwrite=False):
+		def add_file(path, file_obj, printer_profile=None, links=None, allow_overwrite=False, display=None):
 			file_obj.save("prefix/" + path)
 			return path
 		self.local_storage.add_file.side_effect = add_file
@@ -447,7 +464,11 @@ class FileManagerTest(unittest.TestCase):
 
 		# assert that model links were added
 		expected_links = [("model", dict(name="source.file"))]
-		self.local_storage.add_file.assert_called_once_with("dest.file", mock.ANY, printer_profile=expected_printer_profile, allow_overwrite=True, links=expected_links)
+		self.local_storage.add_file.assert_called_once_with("dest.file", mock.ANY,
+		                                                    printer_profile=expected_printer_profile,
+		                                                    allow_overwrite=True,
+		                                                    links=expected_links,
+		                                                    display=None)
 
 		# assert that the generated gcode was manipulated as required
 		expected_atomic_write_calls = [mock.call("prefix/dest.file", "wb")]
